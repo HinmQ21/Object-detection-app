@@ -17,6 +17,9 @@ A Flask-based web application for object detection using YOLO models. This appli
 object_detection_app/
 ├── app.py                  # Main application entry point
 ├── config.py               # Application configuration
+├── docs/                   # Documentation
+│   └── images/             # Example images for documentation
+│       └── example.jpg     # Example of object detection results
 ├── models/                 # Model management
 │   └── model_manager.py    # YOLO model loading and management
 ├── routes/                 # Application routes
@@ -98,6 +101,14 @@ object_detection_app/
 3. Click "Upload" to start the detection process
 4. Wait for the processing to complete
 5. View the original and processed images with detection results
+
+### Example
+
+Below is an example of the object detection process:
+
+![Object Detection Example](docs/images/example.jpg)
+
+The application first displays the original uploaded image, then shows both the original and processed images with bounding boxes highlighting detected objects. Each detected object is labeled with its class name and confidence score.
 
 ## Model Options
 
