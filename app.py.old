@@ -1,0 +1,321 @@
+from flask import Flask, render_template, request, jsonify, send_from_directory
+import os
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+import io
+import uuid
+from ultralytics import YOLO
+import time
+import concurrent.futures
+import threading
+from collections import defaultdict
+
+app = Flask(__name__, template_folder='template')
+
+UPLOAD_FOLDER = 'static/uploads'
+
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
+MAX_IMAGE_DIMENSION = 1280
+MODEL_SZ = 640
+
+AVAILABLE_MODELS = {
+    'yolo11n': {
+        'path': 'yolo11n.pt',
+        'description': 'Nano - Nhẹ nhất, tốc độ nhanh nhất, độ chính xác thấp nhất'
+    },
+    'yolo11s': {
+        'path': 'yolo11s.pt',
+        'description': 'Small - Nhẹ, tốc độ nhanh, độ chính xác trung bình'
+    },
+    'yolo11m': {
+        'path': 'yolo11m.pt',
+        'description': 'Medium - Cân bằng giữa tốc độ và độ chính xác'
+    },
+    'yolo11l': {
+        'path': 'yolo11l.pt',
+        'description': 'Large - Chậm hơn, độ chính xác cao'
+    },
+    'yolo11x': {
+        'path': 'yolo11x.pt',
+        'description': 'XLarge - Chậm nhất, độ chính xác cao nhất'
+    }
+}
+
+DEFAULT_MODEL = 'yolo11m'
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+loaded_models = {}
+
+task_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+tasks = {}
+task_lock = threading.Lock()
+
+TASK_STATUS_PENDING = 'pending'
+TASK_STATUS_PROCESSING = 'processing'
+TASK_STATUS_COMPLETED = 'completed'
+TASK_STATUS_FAILED = 'failed'
+
+def get_model(model_name):
+    """Load and return the specified YOLO model"""
+    if model_name not in AVAILABLE_MODELS:
+        model_name = DEFAULT_MODEL
+
+    if model_name not in loaded_models:
+        model_path = AVAILABLE_MODELS[model_name]['path']
+        try:
+            loaded_models[model_name] = YOLO(model_path)
+        except Exception as e:
+            print(f"Error loading model {model_name}: {str(e)}")
+            if DEFAULT_MODEL not in loaded_models:
+                loaded_models[DEFAULT_MODEL] = YOLO(AVAILABLE_MODELS[DEFAULT_MODEL]['path'])
+            return loaded_models[DEFAULT_MODEL]
+
+    return loaded_models[model_name]
+
+model = get_model(DEFAULT_MODEL)
+
+def allowed_file(filename):
+    """Kiểm tra xem tệp có định dạng được phép hay không"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def process_image(file_stream):
+    """
+    Process uploaded image:
+    1. Convert to supported format if needed
+    2. Resize if too large
+    3. Return PIL Image object
+    """
+    img = Image.open(file_stream)
+
+    if img.mode == 'RGBA':
+        background = Image.new('RGB', img.size, (255, 255, 255))
+        background.paste(img, mask=img.split()[3])
+        img = background
+    elif img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    h, w = img.size
+    if max(h, w) > MODEL_SZ:
+        scale = MODEL_SZ / max(h, w)
+        new_width = int(w * scale)
+        new_height = int(h * scale)
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+
+    img = ImageOps.fit(img, (MODEL_SZ, MODEL_SZ), method=Image.LANCZOS, centering=(0.5, 0.5))
+
+    return img
+
+@app.route('/')
+def index():
+    """Hiển thị trang chính"""
+    return render_template('index.html')
+
+@app.route('/models', methods=['GET'])
+def get_models():
+    models_info = {}
+    for model_name, model_data in AVAILABLE_MODELS.items():
+        models_info[model_name] = {
+            'description': model_data['description']
+        }
+    return jsonify({
+        'models': models_info,
+        'default_model': DEFAULT_MODEL
+    })
+
+def process_detection_task(task_id, filepath, model_name):
+    """
+    Process the detection task asynchronously
+    """
+    try:
+        with task_lock:
+            if task_id not in tasks:
+                return
+            tasks[task_id]['status'] = TASK_STATUS_PROCESSING
+
+        # Load the image
+        pil_img = Image.open(filepath)
+        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+        # Get the model and run detection
+        selected_model = get_model(model_name)
+        results = detect_objects(cv_img, selected_model)
+
+        # Create processed image with bounding boxes
+        processed_filename = 'processed_' + os.path.basename(filepath)
+        processed_filepath = os.path.join(UPLOAD_FOLDER, processed_filename)
+        add_bounding_boxes(cv_img, results, processed_filepath)
+
+        # Update task with results
+        with task_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    'status': TASK_STATUS_COMPLETED,
+                    'original_image': filepath,
+                    'processed_image': processed_filepath,
+                    'detections': results,
+                    'model_used': model_name
+                })
+    except Exception as e:
+        print(f"Error processing task {task_id}: {str(e)}")
+        with task_lock:
+            if task_id in tasks:
+                tasks[task_id].update({
+                    'status': TASK_STATUS_FAILED,
+                    'error': str(e)
+                })
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'Không có file nào được tải lên'}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({'error': 'Không có file nào được chọn'}), 400
+
+    model_name = request.form.get('model', DEFAULT_MODEL)
+
+    if model_name not in AVAILABLE_MODELS:
+        model_name = DEFAULT_MODEL
+
+    if file and allowed_file(file.filename):
+        # Generate unique ID for this task
+        task_id = str(uuid.uuid4())
+        filename = f"{task_id}.jpg"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+
+        try:
+            # Process and save the uploaded image
+            pil_img = process_image(file)
+            pil_img.save(filepath, 'JPEG', quality=95)
+
+            # Create a new task
+            with task_lock:
+                tasks[task_id] = {
+                    'status': TASK_STATUS_PENDING,
+                    'created_at': time.time(),
+                    'original_image': filepath,
+                    'model_used': model_name
+                }
+
+            # Submit the task to the thread pool
+            task_pool.submit(process_detection_task, task_id, filepath, model_name)
+
+            # Return the task ID immediately
+            return jsonify({
+                'task_id': task_id,
+                'status': TASK_STATUS_PENDING,
+                'original_image': filepath
+            })
+
+        except Exception as e:
+            return jsonify({'error': f'Lỗi xử lý hình ảnh: {str(e)}'}), 500
+
+    return jsonify({'error': 'File không hợp lệ'}), 400
+
+def detect_objects(image, selected_model=None):
+    detection_model = selected_model if selected_model is not None else model
+
+    results = detection_model(image, imgsz=MODEL_SZ)
+
+    detections = []
+
+    for r in results:
+        boxes = r.boxes
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            name = detection_model.names[cls]
+
+            detections.append({
+                'class': name,
+                'confidence': round(conf, 2),
+                'bbox': [x1, y1, x2, y2]
+            })
+
+    return detections
+
+def add_bounding_boxes(image, detections, output_path):
+    for det in detections:
+        x1, y1, x2, y2 = det['bbox']
+        label = f"{det['class']} {det['confidence']:.2f}"
+
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 1
+
+        (label_width, label_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
+        cv2.rectangle(image, (x1, y1 - label_height - 10), (x1 + label_width, y1), (0, 255, 0), -1)
+
+        cv2.putText(image, label, (x1, y1 - 5), font, font_scale, (0, 0, 0), thickness)
+
+    cv2.imwrite(output_path, image)
+
+@app.route('/task/<task_id>', methods=['GET'])
+def get_task_status(task_id):
+    """
+    Get the status of a task
+    """
+    with task_lock:
+        if task_id not in tasks:
+            return jsonify({'error': 'Task not found'}), 404
+
+        task_data = tasks[task_id].copy()
+
+    # Return different response based on task status
+    status = task_data.get('status')
+
+    if status == TASK_STATUS_PENDING or status == TASK_STATUS_PROCESSING:
+        # Task is still in progress
+        return jsonify({
+            'task_id': task_id,
+            'status': status,
+            'original_image': task_data.get('original_image')
+        })
+    elif status == TASK_STATUS_COMPLETED:
+        # Task is completed, return full results
+        return jsonify({
+            'task_id': task_id,
+            'status': status,
+            'original_image': task_data.get('original_image'),
+            'processed_image': task_data.get('processed_image'),
+            'detections': task_data.get('detections'),
+            'model_used': task_data.get('model_used')
+        })
+    else:
+        # Task failed
+        return jsonify({
+            'task_id': task_id,
+            'status': status,
+            'error': task_data.get('error', 'Unknown error')
+        }), 500
+
+# Task cleanup function - remove old tasks periodically
+def cleanup_old_tasks():
+    """Remove tasks older than 1 hour"""
+    current_time = time.time()
+    with task_lock:
+        task_ids_to_remove = []
+        for task_id, task_data in tasks.items():
+            # Remove tasks older than 1 hour (3600 seconds)
+            if current_time - task_data.get('created_at', current_time) > 3600:
+                task_ids_to_remove.append(task_id)
+
+        for task_id in task_ids_to_remove:
+            del tasks[task_id]
+
+if __name__ == '__main__':
+    # Start a timer to clean up old tasks every 15 minutes
+    cleanup_timer = threading.Timer(900, cleanup_old_tasks)
+    cleanup_timer.daemon = True
+    cleanup_timer.start()
+
+    app.run(debug=True)
