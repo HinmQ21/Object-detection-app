@@ -129,6 +129,22 @@ The application follows a modular architecture:
 5. **Model Management**: Loads and caches YOLO models for efficient inference
 6. **Image Processing**: Handles various image formats and sizes
 
+### Application Flow
+
+Below is a diagram showing the flow of data and processing in the application:
+
+![Application Flow Diagram](docs/flow.jpg)
+
+The diagram illustrates how:
+1. The user uploads an image via the frontend
+2. The frontend sends a POST request to the backend
+3. The backend creates a task and returns a task ID immediately
+4. The frontend polls for task status while ThreadPoolExecutor processes the detection task
+5. YOLO inference is performed asynchronously in the background
+6. When processing completes, results are returned to the frontend
+
+This asynchronous architecture ensures the application remains responsive even when processing multiple detection tasks simultaneously.
+
 ## License
 
 [MIT License](LICENSE)
